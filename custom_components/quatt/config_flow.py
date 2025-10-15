@@ -7,6 +7,7 @@ from typing import Optional
 import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.const import CONF_IP_ADDRESS
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -15,8 +16,9 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger("custom_components.quatt.config_flow")
 
 STEP_USER_SCHEMA = vol.Schema({vol.Required("cic_serial"): str})
+STEP_HOST_SCHEMA = vol.Schema({vol.Required(CONF_IP_ADDRESS): str})
 
-# Public mobile-app identifiers (not secrets)
+# Mobile-app identifiers (public)
 BASE_URL = "https://mobile-api.quatt.io/api/v1"
 FIREBASE_API_KEY = "AIzaSyDM4PIXYDS9x53WUj-tDjOVAb6xKgzxX9Y"
 FIREBASE_PROJECT_ID = "quatt-production"
@@ -33,8 +35,7 @@ POLL_INTERVAL_S = 2
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Quatt config flow: serial -> requestPair -> progress -> auto-finish."""
-
+    """Quatt config flow with CIC pairing and optional host entry."""
     VERSION = 1
 
     _user_data: dict | None = None
@@ -42,11 +43,18 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _pair_error: Optional[str] = None
     _pre_id_token: Optional[str] = None
     _pre_refresh_token: Optional[str] = None
+    _resolved_host: Optional[str] = None
 
     async def async_step_user(self, user_input: dict | None = None) -> FlowResult:
         if user_input is None:
             _LOGGER.debug("Step user: showing CIC serial form")
-            return self.async_show_form(step_id="user", data_schema=STEP_USER_SCHEMA)
+            return self.async_show_form(
+                step_id="user",
+                data_schema=STEP_USER_SCHEMA,
+                description_placeholders={
+                    "hint": "Find the CIC serial in the Quatt app: Settings → Device → Controller (CIC). Example: CIC-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                },
+            )
 
         cic_serial = (user_input.get("cic_serial") or "").strip()
         if not cic_serial:
@@ -58,26 +66,32 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return await self.async_step_pair()
 
     async def async_step_pair(self, user_input: dict | None = None) -> FlowResult:
-        """Maintain progress UI; when background finishes, close with progress_done -> create."""
+        """Maintain progress UI; when background finishes, close with progress_done -> host/create."""
         if self._user_data is None:
             return await self.async_step_user(user_input=None)
 
+        # If task already finished, move forward
         if self._pair_task is not None and self._pair_task.done():
-            _LOGGER.debug("Step pair: task finished; returning progress_done -> create")
-            return self.async_show_progress_done(next_step_id="create")
+            _LOGGER.debug("Step pair: task finished; returning progress_done -> host/create")
+            return self.async_show_progress_done(next_step_id="host")
 
+        # Start background job once
         if self._pair_task is None:
             _LOGGER.debug("Step pair: creating background pairing task")
             self._pair_task = self.hass.async_create_task(self._pairing_background())
 
+        # Show progress screen that will auto-advance when the task completes
         return self.async_show_progress(
             step_id="pair",
             progress_action="waiting_for_cic",
             progress_task=self._pair_task,
+            description_placeholders={
+                "msg": "Press the physical button on the CIC within ~2 minutes to confirm pairing."
+            },
         )
 
     async def _pairing_background(self) -> None:
-        """signup -> PUT /me -> requestPair -> poll until confirmed."""
+        """signup -> PUT /me -> requestPair -> poll until confirmed; then try auto host resolve."""
         assert self._user_data is not None
         cic_serial = self._user_data["cic_serial"]
         session = async_get_clientsession(self.hass)
@@ -89,16 +103,20 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._pre_refresh_token = refresh_token
             _LOGGER.debug("[pair] signup ok: id_token len=%s", len(id_token))
 
-            _LOGGER.debug("[pair] PUT /me")
+            _LOGGER.debug("[pair] PUT /me (register display name)")
             await self._put_me(session, id_token)
 
-            _LOGGER.debug("[pair] POST requestPair for %s", cic_serial)
+            _LOGGER.debug("[pair] POST requestPair for CIC serial: %s", cic_serial)
             await self._post_request_pair(session, id_token, cic_serial)
-            _LOGGER.debug("[pair] requestPair accepted, polling...")
+            _LOGGER.debug("[pair] requestPair accepted, polling for confirmation...")
 
             ok = await self._poll_confirmed(session, id_token, timeout_s=PAIR_TIMEOUT_S, interval_s=POLL_INTERVAL_S)
             self._pair_error = None if ok else "pair_failed"
             _LOGGER.debug("[pair] poll finished: ok=%s", ok)
+
+            # Attempt to resolve a reachable host for local API, so we can skip the host step if possible
+            if ok:
+                self._resolved_host = await self._pick_reachable_host(session, cic_serial)
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
             _LOGGER.debug("[pair] network error: %r", net_err)
@@ -106,6 +124,48 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception("[pair] unexpected error: %s", err)
             self._pair_error = "unknown"
+
+    async def async_step_host(self, user_input: dict | None = None) -> FlowResult:
+        """If we couldn't auto-resolve a local host, ask user for IP/hostname and validate it."""
+        if self._pair_error:
+            # Pairing failed; go back to user step with error
+            self._pair_task = None
+            return self.async_show_form(
+                step_id="user",
+                data_schema=STEP_USER_SCHEMA,
+                errors={"base": self._pair_error},
+            )
+
+        # If we already have a working host, skip straight to create
+        if self._resolved_host:
+            _LOGGER.debug("Step host: auto-resolved host '%s' — skipping host form", self._resolved_host)
+            return await self.async_step_create()
+
+        # Otherwise, ask user for an IP/hostname and validate
+        if user_input is None:
+            _LOGGER.debug("Step host: showing host form")
+            return self.async_show_form(
+                step_id="host",
+                data_schema=STEP_HOST_SCHEMA,
+                description_placeholders={
+                    "hint": "Enter the CIC IP address or hostname. Example: 192.168.1.42 or CIC-xxxx....local"
+                },
+            )
+
+        host = (user_input.get(CONF_IP_ADDRESS) or "").strip()
+        if not host:
+            return self.async_show_form(
+                step_id="host", data_schema=STEP_HOST_SCHEMA, errors={"base": "required"}
+            )
+
+        session = async_get_clientsession(self.hass)
+        if not await self._probe_host(session, host):
+            return self.async_show_form(
+                step_id="host", data_schema=STEP_HOST_SCHEMA, errors={"base": "cannot_connect"}
+            )
+
+        self._resolved_host = host
+        return await self.async_step_create()
 
     async def async_step_create(self, user_input: dict | None = None) -> FlowResult:
         assert self._user_data is not None
@@ -134,7 +194,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             "pre_id_token": self._pre_id_token or "",
             "pre_refresh_token": self._pre_refresh_token or "",
         }
-        _LOGGER.debug("Step create: creating entry; cic=%s", cic_serial)
+        # Include IP/host if we resolved or the user entered it
+        if self._resolved_host:
+            data[CONF_IP_ADDRESS] = self._resolved_host
+
+        _LOGGER.debug("Step create: creating entry; cic=%s, host=%s", cic_serial, data.get(CONF_IP_ADDRESS))
         return self.async_create_entry(title="Quatt", data=data)
 
     # ---- HTTP helpers (config-flow only) ----
@@ -216,3 +280,27 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 pass
             await asyncio.sleep(interval_s)
         return False
+
+    # ---- Local host discovery/validation helpers ----
+    async def _pick_reachable_host(self, session: aiohttp.ClientSession, cic_serial: str) -> str | None:
+        """Return a reachable host/ip for the CIC local API, or None."""
+        s = cic_serial.strip()
+        if len(s) >= 3:
+            s = s[:3].upper() + s[3:]
+        candidates = [s, s.lower(), f"{s}.local", f"{s.lower()}.local"]
+        seen: set[str] = set()
+        for host in [c for c in candidates if not (c in seen or seen.add(c))]:
+            if await self._probe_host(session, host):
+                _LOGGER.debug("[host] auto-resolved working host: %s", host)
+                return host
+        return None
+
+    async def _probe_host(self, session: aiohttp.ClientSession, host: str) -> bool:
+        """Quickly check if we can GET the local feed on this host."""
+        url = f"http://{host}:8080/beta/feed/data.json"
+        try:
+            timeout = aiohttp.ClientTimeout(total=4)
+            async with session.get(url, timeout=timeout) as resp:
+                return resp.status == 200
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return False
