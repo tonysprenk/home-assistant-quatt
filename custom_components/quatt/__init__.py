@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from importlib.util import find_spec
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
@@ -9,16 +11,23 @@ from .quatt_cloud import QuattCloud, QuattCloudConfig
 
 _LOGGER = logging.getLogger(__name__)
 
-# Keep the original platform list (from the repo). Example:
-PLATFORMS = ["sensor", "climate"]  # do not change unless you add new ones
+# Try these; we'll filter to only those that are present in your repo
+PLATFORM_CANDIDATES = [
+    "sensor",
+    "climate",
+    "button",
+    "number",
+    "select",
+    "switch",
+    "binary_sensor",
+]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    # Original setup remains (local CIC API, coordinator, etc.)
-    # ... your existing code that creates 'api' / 'coordinator' stays here ...
-
-    # NEW: create the cloud client from entry.data (populated by config_flow)
+    """Set up Quatt from a config entry."""
     data = entry.data
+
+    # Build the cloud client (used now for discovery, later for controls)
     cloud_cfg = QuattCloudConfig(
         base_url=data["base_url"],
         firebase_api_key=data["firebase_api_key"],
@@ -36,24 +45,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     )
     cloud = QuattCloud(hass, cloud_cfg)
 
-    # Try to discover installation id (non-fatal)
+    # Best-effort: discover installation id now (non-fatal)
     try:
         await cloud.async_discover()
     except Exception as err:  # noqa: BLE001
-        _LOGGER.debug("Cloud discovery failed (will retry later in commands): %r", err)
+        _LOGGER.debug("Cloud discovery failed (will retry later if needed): %r", err)
 
+    # Stash references (keep any existing data the original integration uses)
     hass.data.setdefault(DOMAIN, {})
-    # Ensure we keep whatever the original integration put here:
     hass.data[DOMAIN].setdefault(entry.entry_id, {})
-    hass.data[DOMAIN][entry.entry_id]["cloud"] = cloud  # stash for future controls
+    hass.data[DOMAIN][entry.entry_id]["cloud"] = cloud
 
-    # Continue with the original platform forwarding:
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # Auto-detect which platform files actually exist in this repo
+    platforms = [
+        p for p in PLATFORM_CANDIDATES
+        if find_spec(f"custom_components.{DOMAIN}.{p}") is not None
+    ]
+    _LOGGER.debug("Forwarding platforms for setup: %s", platforms)
+
+    if platforms:
+        await hass.config_entries.async_forward_entry_setups(entry, platforms)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    """Unload a config entry."""
+    # Mirror the platforms we loaded on setup
+    platforms = [
+        p for p in PLATFORM_CANDIDATES
+        if find_spec(f"custom_components.{DOMAIN}.{p}") is not None
+    ]
+    _LOGGER.debug("Unloading platforms: %s", platforms)
+
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
     if unload_ok:
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return unload_ok
