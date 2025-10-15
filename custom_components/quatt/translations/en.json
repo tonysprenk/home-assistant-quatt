@@ -1,40 +1,26 @@
 {
-    "config": {
-        "flow_title": "CIC: {name}",
-        "step": {
-            "user": {
-                "description": "Set up your Quatt heatpump for monitoring.",
-                "data": {
-                    "ip_address": "IP address / hostname"
-                },
-                "data_description": {
-                    "ip_address": "Without http:// and port."
-                }
-            },
-            "confirm": {
-                "description": "Do you want to start setup?"
-            }
-        },
-        "error": {
-            "cannot_connect": "Failed to connect."
-        },
-        "abort": {
-            "already_configured": "Device is already configured."
+  "config": {
+    "step": {
+      "user": {
+        "title": "Quatt pairing",
+        "description": "Enter your CIC serial. You can find it in the Quatt app under Settings → Device → Controller (CIC). Example: CIC-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+        "data": {
+          "cic_serial": "CIC serial"
         }
+      },
+      "pair": {
+        "title": "Confirm on the CIC",
+        "description": "Press the physical button on the CIC within 2 minutes to confirm pairing."
+      }
     },
-    "options": {
-        "step": {
-            "init": {
-                "description": "Quatt options",
-                "data": {
-                    "scan_interval": "Update interval (Seconds)",
-                    "power_sensor": "Power sensor (Optional)"
-                },
-                "data_description": {
-                    "scan_interval": "Number of seconds between requesting information from the Quatt.",
-                    "power_sensor": "External energy sensor that measures the current energy consumption of the Quatt."
-                }
-            }
-        }
+    "error": {
+      "required": "This field is required",
+      "connection": "Network error while contacting Quatt",
+      "pair_failed": "Timed out waiting for CIC confirmation",
+      "unknown": "Unexpected error"
+    },
+    "progress": {
+      "waiting_for_cic": "Waiting for CIC button confirmation…"
     }
+  }
 }
